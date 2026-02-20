@@ -138,6 +138,18 @@ from sonos_core import announce
 announce('audio.mp3')
 ```
 
+## Supported Platforms
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| macOS | ✅ Supported | Full support |
+| Linux | ✅ Supported | Full support |
+| Windows | ✅ Supported | Uses `taskkill` and `start /b` |
+
+The module automatically detects your platform and uses appropriate commands for:
+- Killing the HTTP server
+- Starting the HTTP server in background
+
 ## State Restoration
 
 The module intelligently restores previous playback state:

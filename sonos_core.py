@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""
+Sonos Core - Shared module for Sonos announcement playback with state restoration.
+
+This module handles the core logic of:
+1. Discovering Sonos speakers and coordinators
+2. Saving current playback state
+3. Pausing if needed (handling Line-In specially)
+4. Playing an audio file
+5. Restoring previous playback state
+
+Can be imported by other scripts or called directly.
+"""
+
+import soco
+import time
+import subprocess
+import socket
+import os
+
+# HTTP server config
+HTTP_HOST = '192.168.1.178'
+HTTP_PORT = 8888
+
+
+def is_server_running(host=HTTP_HOST, port=HTTP_PORT):
+    """Check if the HTTP server is running."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    result = sock.connect_ex((host, port))
+    sock.close()
+    return result == 0
+
+
+def start_http_server(media_dir=None):
+    """Start the HTTP server for streaming audio to Sonos."""
+    if media_dir is None:
+        media_dir = os.path.expanduser("~/.openclaw/media/outbound")
+    
+    if not is_server_running():
+        print("Starting HTTP server...")
+        os.system(f"cd {media_dir} && python3 -m http.server {HTTP_PORT} &")
+        time.sleep(2)
+
+
+def is_external_input(uri):
+    """
+    Check if URI is an external input (Line-In, TV, Bluetooth, etc.)
+    These sources can't be paused/resumed - they must be restored after announcement.
+    """
+    if not uri:
+        return False
+    
+    # External input patterns (should NOT be paused)
+    external_patterns = [
+        'x-rincon:RINCON_',           # Line-In (direct)
+        'x-rincon-stream:RINCON_',    # Line-In (stream)
+        'x-sonos-htastream:',         # TV/HDMI (Sonos Home Theater)
+        'x-sonos-vanished:',          # Vanished device
+        'x-rincon蓝牙:',               # Bluetooth (Chinese)
+        'x-rincon-bt:',               # Bluetooth
+        'x-sonos-aphone:',            # Phone/USB input
+    ]
+    
+    return any(pattern in uri for pattern in external_patterns)
+
+
+def get_audio_duration(file_path):
+    """Get actual audio duration using ffprobe."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', file_path],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except Exception as e:
+        print(f"Could not get duration: {e}")
+    return None
+
+
+def discover_coordinators():
+    """Discover all Sonos group coordinators."""
+    speakers = list(soco.discover())
+    if not speakers:
+        raise Exception("No Sonos speakers found")
+    
+    coordinators = []
+    seen_uuids = set()
+    for s in speakers:
+        try:
+            if hasattr(s, 'group') and s.group:
+                coordinator = s.group.coordinator
+                if coordinator and coordinator.uid not in seen_uuids:
+                    seen_uuids.add(coordinator.uid)
+                    coordinators.append(coordinator)
+            else:
+                if s.uid not in seen_uuids:
+                    seen_uuids.add(s.uid)
+                    coordinators.append(s)
+        except Exception:
+            if s.ip_address not in [sp.ip_address for sp in coordinators]:
+                coordinators.append(s)
+    
+    return coordinators
+
+
+def save_state(coordinators):
+    """Save playback state for all coordinators."""
+    states = {}
+    for s in coordinators:
+        try:
+            t = s.get_current_transport_info()
+            tr = s.get_current_track_info()
+            
+            uri = t.get('uri', tr.get('uri', ''))
+            # Try both keys - soco uses 'current_transport_state'
+            transport_state = t.get('current_transport_state') or t.get('transport_state', 'STOPPED')
+            
+            pos = tr.get('position', '0:00:00')
+            if pos == 'NOT_IMPLEMENTED':
+                pos = '0:00:00'
+            
+            queue_pos = tr.get('playlist_position', None)
+            if queue_pos:
+                try:
+                    queue_pos = int(queue_pos) - 1
+                except:
+                    queue_pos = None
+            
+            is_external = is_external_input(uri)
+            
+            # Determine what to restore to
+            was_playing = transport_state == 'PLAYING' and not is_external
+            was_paused = transport_state == 'PAUSED' and not is_external
+            was_no_content = transport_state == 'NO_CONTENT' or not uri
+            
+            states[s.ip_address] = {
+                'uri': uri,
+                'position': pos,
+                'queue_position': queue_pos,
+                'was_playing': was_playing,
+                'was_paused': was_paused,
+                'was_no_content': was_no_content,
+                'is_external': is_external,
+                'transport_state': transport_state,
+                'speaker_name': s.player_name,
+            }
+        except Exception as e:
+            print(f"  {s.player_name}: error saving state - {e}")
+            states[s.ip_address] = {
+                'uri': '', 'position': '0:00:00', 'queue_position': None,
+                'was_playing': False, 'was_paused': False, 'was_no_content': True,
+                'is_external': False, 'transport_state': 'NO_CONTENT',
+                'speaker_name': s.player_name,
+            }
+    
+    return states
+
+
+def prepare_speakers(coordinators, states):
+    """Pause speakers if needed (skip Line-In)."""
+    for s in coordinators:
+        state = states.get(s.ip_address, {})
+        
+        if state.get('is_external'):
+            print(f"  {s.player_name}: External input - skipping pause")
+            continue
+        
+        if state.get('was_playing'):
+            try:
+                s.pause()
+                print(f"  {s.player_name}: was playing - paused")
+            except Exception as e:
+                print(f"  {s.player_name}: pause error - {e}")
+        elif state.get('was_no_content'):
+            print(f"  {s.player_name}: No Content - will stop after announcement")
+        else:
+            print(f"  {s.player_name}: was paused or stopped - skipping")
+
+
+def play_announcement(coordinators, audio_url):
+    """Play announcement on all coordinators."""
+    for s in coordinators:
+        try:
+            s.play_uri(audio_url, force_radio=True)
+            print(f"  {s.player_name}: playing announcement")
+        except Exception as e:
+            print(f"  {s.player_name}: play error - {e}")
+
+
+def restorePlayback(coordinators, states):
+    """Restore playback state after announcement."""
+    for s in coordinators:
+        state = states.get(s.ip_address, {})
+        
+        if state.get('is_external'):
+            try:
+                print(f"  {s.player_name}: restoring external input")
+                s.play_uri(state['uri'])
+            except Exception as e:
+                print(f"  {s.player_name}: Line-In restore error - {e}")
+            continue
+        
+        # Handle NO_CONTENT - stop playback (wasn't playing anything)
+        if state.get('was_no_content'):
+            print(f"  {s.player_name}: was No Content - stopping (was not playing)")
+            try:
+                s.stop()
+            except Exception as e:
+                print(f"  {s.player_name}: stop error - {e}")
+            continue
+        
+        # Handle PAUSED - restore to paused state
+        if state.get('was_paused'):
+            try:
+                queue_pos = state.get('queue_position')
+                uri = state.get('uri', '')
+                is_streaming = any(x in uri for x in ['spotify:', 'x-sonos-spotify:', 'x-rincon-mp3radio:', 'pandora:', 'tidal:'])
+                
+                if queue_pos is not None and queue_pos >= 0:
+                    print(f"  {s.player_name}: restoring to paused at queue {queue_pos}")
+                    s.play_from_queue(queue_pos)
+                    time.sleep(0.5)
+                    if not is_streaming:
+                        s.seek(state['position'])
+                        time.sleep(0.5)
+                    s.pause()
+                elif uri:
+                    print(f"  {s.player_name}: restoring to paused")
+                    s.play_uri(uri)
+                    time.sleep(0.5)
+                    if not is_streaming:
+                        s.seek(state['position'])
+                        time.sleep(0.5)
+                    s.pause()
+            except Exception as e:
+                print(f"  {s.player_name}: pause restore error - {e}")
+            continue
+        
+        if not state.get('was_playing'):
+            print(f"  {s.player_name}: was stopped - staying stopped")
+            continue
+        
+        # Restore to playing
+        try:
+            queue_pos = state.get('queue_position')
+            uri = state.get('uri', '')
+            # Check if it's a streaming service (Spotify, etc) - can't seek on these
+            is_streaming = any(x in uri for x in ['spotify:', 'x-sonos-spotify:', 'x-rincon-mp3radio:', 'pandora:', 'tidal:'])
+            
+            if queue_pos is not None and queue_pos >= 0:
+                print(f"  {s.player_name}: resuming from queue {queue_pos}")
+                s.play_from_queue(queue_pos)
+                time.sleep(0.5)
+                if not is_streaming:
+                    s.seek(state['position'])
+                    time.sleep(0.5)
+                s.play()
+            elif uri:
+                print(f"  {s.player_name}: resuming at {state['position']} (streaming={is_streaming})")
+                if is_streaming:
+                    # For streaming services, just restart the URI without seeking
+                    s.play_uri(uri)
+                else:
+                    s.play_uri(uri)
+                    time.sleep(0.5)
+                    s.seek(state['position'])
+                    time.sleep(0.5)
+                s.play()
+            else:
+                s.play()
+        except Exception as e:
+            print(f"  {s.player_name}: restore error - {e}")
+
+
+def announce(audio_file_path, wait_for_audio=True, media_dir=None):
+    """
+    Core function: Play audio on Sonos and restore previous state.
+    
+    Args:
+        audio_file_path: Path to the audio file to play
+        media_dir: Directory to serve from HTTP server (default: ~/.openclaw/media/outbound)
+        wait_for_audio: If True, calculate duration and wait. If False, just wait a fixed time.
+    
+    Returns:
+        dict: Summary of what happened
+    """
+    print(f"=== Sonos Announcement ===")
+    print(f"Audio: {audio_file_path}")
+    
+    # Ensure HTTP server is running
+    start_http_server(media_dir)
+    
+    # Get audio duration
+    if wait_for_audio:
+        duration = get_audio_duration(audio_file_path)
+        if duration:
+            wait_time = max(duration + 3, 5)
+            print(f"Duration: {duration:.1f}s, waiting {wait_time:.1f}s")
+        else:
+            wait_time = 10
+            print(f"Could not determine duration, waiting {wait_time}s")
+    else:
+        wait_time = 5
+        print(f"Waiting fixed {wait_time}s")
+    
+    # Discover and save state
+    print("Discovering speakers...")
+    coordinators = discover_coordinators()
+    print(f"Found {len(coordinators)} coordinator(s)")
+    
+    print("Saving state...")
+    states = save_state(coordinators)
+    for ip, state in states.items():
+        ext = " (External)" if state.get('is_external') else ""
+        print(f"  {state['speaker_name']}: {state['transport_state']}{ext}")
+    
+    # Prepare (pause if needed)
+    print("Preparing speakers...")
+    prepare_speakers(coordinators, states)
+    time.sleep(0.5)
+    
+    # Play
+    audio_filename = os.path.basename(audio_file_path)
+    audio_url = f"http://{HTTP_HOST}:{HTTP_PORT}/{audio_filename}"
+    print(f"Playing: {audio_url}")
+    play_announcement(coordinators, audio_url)
+    
+    # Wait for announcement
+    print(f"Waiting {wait_time:.1f}s...")
+    time.sleep(wait_time)
+    
+    # Restore
+    print("Restoring playback...")
+    restorePlayback(coordinators, states)
+    
+    print("=== Done ===")
+    return {
+        'coordinators': len(coordinators),
+        'states': states,
+    }
+
+
+# CLI entry point
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python sonos_core.py <audio_file>")
+        sys.exit(1)
+    
+    audio_file = sys.argv[1]
+    announce(audio_file)

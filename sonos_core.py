@@ -65,7 +65,7 @@ def is_server_running(host=HTTP_HOST, port=HTTP_PORT):
 def start_http_server(media_dir=None):
     """Start the HTTP server for streaming audio to Sonos."""
     if media_dir is None:
-        media_dir = os.path.expanduser("~/.openclaw/media/outbound")
+        media_dir = os.path.expanduser("~/.local/share/openclaw/media/outbound")
     
     # Always restart to ensure correct directory
     if is_server_running():
@@ -312,7 +312,7 @@ def announce(audio_file_path, wait_for_audio=True, media_dir=None):
     
     Args:
         audio_file_path: Path to the audio file to play
-        media_dir: Directory to serve from HTTP server (default: ~/.openclaw/media/outbound)
+        media_dir: Directory to serve from HTTP server (default: ~/.local/share/openclaw/media/outbound)
         wait_for_audio: If True, calculate duration and wait. If False, just wait a fixed time.
     
     Returns:

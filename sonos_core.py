@@ -18,6 +18,7 @@ import subprocess
 import socket
 import os
 import urllib.parse
+import platform
 
 
 def get_local_ip():
@@ -70,11 +71,17 @@ def start_http_server(media_dir=None):
     # Always restart to ensure correct directory
     if is_server_running():
         print("Stopping existing HTTP server...")
-        os.system(f"pkill -f 'python3 -m http.server {HTTP_PORT}'")
+        if platform.system() == "Windows":
+            os.system(f'taskkill /f /im python.exe 2>nul')
+        else:
+            os.system(f"pkill -f 'python3 -m http.server {HTTP_PORT}'")
         time.sleep(1)
     
     print(f"Starting HTTP server from {media_dir}...")
-    os.system(f"cd {media_dir} && python3 -m http.server {HTTP_PORT} &")
+    if platform.system() == "Windows":
+        os.system(f'start /b python -m http.server {HTTP_PORT}')
+    else:
+        os.system(f'cd "{media_dir}" && python3 -m http.server {HTTP_PORT} &')
     time.sleep(2)
 
 

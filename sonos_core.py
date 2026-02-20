@@ -17,10 +17,40 @@ import time
 import subprocess
 import socket
 import os
+import urllib.parse
 
-# HTTP server config
-HTTP_HOST = '192.168.1.178'
-HTTP_PORT = 8888
+
+def get_local_ip():
+    """Auto-detect the machine's LAN IP address."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Doesn't actually connect, just gets the route
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
+
+
+# HTTP server config - auto-detect IP, allow env override
+HTTP_HOST = os.environ.get('SONOS_HTTP_HOST') or get_local_ip()
+HTTP_PORT = int(os.environ.get('SONOS_HTTP_PORT', 8888))
+
+
+def can_seek_uri(uri):
+    """Check if the URI supports seeking (local files, queues, track/playlist streams)."""
+    if not uri:
+        return False
+    # Decode URI for checking (Sonos sends URL-encoded)
+    uri_decoded = urllib.parse.unquote(uri)
+    # These cannot be seeked
+    if any(x in uri_decoded for x in ['x-rincon-mp3radio:', 'pandora:']):
+        return False
+    # Spotify/Tidal: only track and playlist can seek, radio/station cannot
+    if 'spotify' in uri_decoded or 'tidal' in uri_decoded:
+        return any(x in uri_decoded for x in ['track:', 'playlist:'])
+    return True
 
 
 def is_server_running(host=HTTP_HOST, port=HTTP_PORT):
@@ -37,10 +67,15 @@ def start_http_server(media_dir=None):
     if media_dir is None:
         media_dir = os.path.expanduser("~/.openclaw/media/outbound")
     
-    if not is_server_running():
-        print("Starting HTTP server...")
-        os.system(f"cd {media_dir} && python3 -m http.server {HTTP_PORT} &")
-        time.sleep(2)
+    # Always restart to ensure correct directory
+    if is_server_running():
+        print("Stopping existing HTTP server...")
+        os.system(f"pkill -f 'python3 -m http.server {HTTP_PORT}'")
+        time.sleep(1)
+    
+    print(f"Starting HTTP server from {media_dir}...")
+    os.system(f"cd {media_dir} && python3 -m http.server {HTTP_PORT} &")
+    time.sleep(2)
 
 
 def is_external_input(uri):
@@ -71,7 +106,7 @@ def get_audio_duration(file_path):
         result = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
              '-of', 'default=noprint_wrappers=1:nokey=1', file_path],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=60
         )
         if result.returncode == 0 and result.stdout.strip():
             return float(result.stdout.strip())
@@ -217,13 +252,12 @@ def restorePlayback(coordinators, states):
             try:
                 queue_pos = state.get('queue_position')
                 uri = state.get('uri', '')
-                is_streaming = any(x in uri for x in ['spotify:', 'x-sonos-spotify:', 'x-rincon-mp3radio:', 'pandora:', 'tidal:'])
                 
                 if queue_pos is not None and queue_pos >= 0:
                     print(f"  {s.player_name}: restoring to paused at queue {queue_pos}")
                     s.play_from_queue(queue_pos)
                     time.sleep(0.5)
-                    if not is_streaming:
+                    if can_seek_uri(uri):
                         s.seek(state['position'])
                         time.sleep(0.5)
                     s.pause()
@@ -231,7 +265,7 @@ def restorePlayback(coordinators, states):
                     print(f"  {s.player_name}: restoring to paused")
                     s.play_uri(uri)
                     time.sleep(0.5)
-                    if not is_streaming:
+                    if can_seek_uri(uri):
                         s.seek(state['position'])
                         time.sleep(0.5)
                     s.pause()
@@ -247,24 +281,21 @@ def restorePlayback(coordinators, states):
         try:
             queue_pos = state.get('queue_position')
             uri = state.get('uri', '')
-            # Check if it's a streaming service (Spotify, etc) - can't seek on these
-            is_streaming = any(x in uri for x in ['spotify:', 'x-sonos-spotify:', 'x-rincon-mp3radio:', 'pandora:', 'tidal:'])
+            # Check if URI supports seeking
+            can_seek = can_seek_uri(uri)
             
             if queue_pos is not None and queue_pos >= 0:
                 print(f"  {s.player_name}: resuming from queue {queue_pos}")
                 s.play_from_queue(queue_pos)
                 time.sleep(0.5)
-                if not is_streaming:
+                if can_seek:
                     s.seek(state['position'])
                     time.sleep(0.5)
                 s.play()
             elif uri:
-                print(f"  {s.player_name}: resuming at {state['position']} (streaming={is_streaming})")
-                if is_streaming:
-                    # For streaming services, just restart the URI without seeking
-                    s.play_uri(uri)
-                else:
-                    s.play_uri(uri)
+                print(f"  {s.player_name}: resuming at {state['position']} (can_seek={can_seek})")
+                s.play_uri(uri)
+                if can_seek:
                     time.sleep(0.5)
                     s.seek(state['position'])
                     time.sleep(0.5)
@@ -293,9 +324,10 @@ def announce(audio_file_path, wait_for_audio=True, media_dir=None):
     # Ensure HTTP server is running
     start_http_server(media_dir)
     
-    # Get audio duration
+    # Get audio duration - use full path for ffprobe
+    full_path = os.path.join(media_dir, audio_file_path) if media_dir else audio_file_path
     if wait_for_audio:
-        duration = get_audio_duration(audio_file_path)
+        duration = get_audio_duration(full_path)
         if duration:
             wait_time = max(duration + 3, 5)
             print(f"Duration: {duration:.1f}s, waiting {wait_time:.1f}s")

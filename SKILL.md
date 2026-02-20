@@ -106,13 +106,12 @@ Automatically detects inputs that cannot be paused:
 
 ## HTTP Server
 
-The module starts an HTTP server at `192.168.1.178:8888` to stream audio to Sonos.
+The module auto-detects your LAN IP and starts an HTTP server to stream audio to Sonos.
 
-**Config:** Edit `sonos_core.py` to change:
-
-```python
-HTTP_HOST = '192.168.1.178'
-HTTP_PORT = 8888
+**Environment variables (optional):**
+```bash
+export SONOS_HTTP_HOST=192.168.1.100  # Override auto-detected IP
+export SONOS_HTTP_PORT=8888             # Override port (default: 8888)
 ```
 
 ## Soundboard Example
@@ -144,9 +143,9 @@ def play_sound(name):
 | No speakers found | Ensure on same network as Sonos speakers |
 | Resume not working | Check speakers were playing (not paused) before announcement |
 | HTTP server failed | Check port 8888 is available |
-| Module import error | Run: `` |
+| Module import error | Run: `pip install soco` |
 
 ## Files
 
-- `sonpip install socoos_core.py` - Main module with `announce()` function
+- `sonos_core.py` - Main module with `announce()` function
 - `SKILL.md` - This documentation

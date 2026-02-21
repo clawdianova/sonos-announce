@@ -68,14 +68,16 @@ def start_http_server(media_dir=None):
     if media_dir is None:
         media_dir = os.path.expanduser("~/.local/share/openclaw/media/outbound")
     
-    # Always restart to ensure correct directory
-    if is_server_running():
-        print("Stopping existing HTTP server...")
-        if platform.system() == "Windows":
-            os.system(f'taskkill /f /im python.exe 2>nul')
-        else:
-            os.system(f"pkill -f 'python3 -m http.server {HTTP_PORT}'")
-        time.sleep(1)
+    # Always kill any stale server first, then start fresh
+    print("Stopping any existing HTTP server...")
+    if platform.system() == "Windows":
+        os.system(f'taskkill /f /t /im python.exe 2>nul')
+    else:
+        # Multiple approaches to ensure port is free
+        os.system(f"fuser -k {HTTP_PORT}/tcp 2>/dev/null")
+        os.system(f"lsof -ti:{HTTP_PORT} | xargs kill -9 2>/dev/null")
+        os.system(f"pkill -9 -f 'python3 -m http.server {HTTP_PORT}' 2>/dev/null")
+    time.sleep(2)
     
     print(f"Starting HTTP server from {media_dir}...")
     if platform.system() == "Windows":

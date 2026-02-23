@@ -73,18 +73,18 @@ def start_http_server(media_dir=None):
     if platform.system() == "Windows":
         os.system(f'taskkill /f /t /im python.exe 2>nul')
     else:
-        # Multiple approaches to ensure port is free
-        os.system(f"fuser -k {HTTP_PORT}/tcp 2>/dev/null")
+        # Kill by port - more reliable on macOS
         os.system(f"lsof -ti:{HTTP_PORT} | xargs kill -9 2>/dev/null")
         os.system(f"pkill -9 -f 'python3 -m http.server {HTTP_PORT}' 2>/dev/null")
-    time.sleep(2)
+    time.sleep(1)
     
     print(f"Starting HTTP server from {media_dir}...")
     if platform.system() == "Windows":
         os.system(f'start /b python -m http.server {HTTP_PORT}')
     else:
-        os.system(f'cd "{media_dir}" && python3 -m http.server {HTTP_PORT} &')
-    time.sleep(2)
+        # Use nohup to ensure it persists
+        os.system(f'nohup python3 -m http.server {HTTP_PORT} --directory "{media_dir}" > /tmp/sonos_http.log 2>&1 &')
+    time.sleep(1)
 
 
 def is_external_input(uri):
@@ -224,12 +224,45 @@ def prepare_speakers(coordinators, states):
             print(f"  {s.player_name}: was paused or stopped - skipping")
 
 
-def play_announcement(coordinators, audio_url):
+def play_announcement(coordinators, audio_url, title=None, artist=None, media_dir=None):
     """Play announcement on all coordinators."""
     for s in coordinators:
         try:
-            s.play_uri(audio_url, force_radio=True)
-            print(f"  {s.player_name}: playing announcement")
+            # Try to extract metadata from file if not provided
+            if not title or not artist:
+                filename = os.path.basename(audio_url)
+                file_path = os.path.join(media_dir or '', filename) if media_dir else filename
+                # Try to read ID3 tags using ffprobe
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', file_path],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        import json
+                        data = json.loads(result.stdout)
+                        tags = data.get('format', {}).get('tags', {})
+                        if not title:
+                            title = tags.get('title', '')
+                        if not artist:
+                            artist = tags.get('artist', '')
+                except Exception:
+                    pass
+            
+            # Fallback to filename parsing if still no metadata
+            if not title:
+                filename = os.path.basename(audio_url)
+                name_without_ext = os.path.splitext(filename)[0]
+                title = name_without_ext.replace('-', ' ').title()
+            
+            if not artist:
+                artist = 'Voice Studio'
+            
+            # Use force_radio=False so Sonos reads ID3 tags from the file
+            # If file has no ID3 tags, pass title/artist as fallback
+            s.play_uri(audio_url, title=title, artist=artist, force_radio=False)
+            print(f"  {s.player_name}: playing '{title}' by {artist}")
         except Exception as e:
             print(f"  {s.player_name}: play error - {e}")
 
@@ -315,7 +348,7 @@ def restorePlayback(coordinators, states):
             print(f"  {s.player_name}: restore error - {e}")
 
 
-def announce(audio_file_path, wait_for_audio=True, media_dir=None):
+def announce(audio_file_path, wait_for_audio=True, media_dir=None, title=None, artist=None):
     """
     Core function: Play audio on Sonos and restore previous state.
     
@@ -323,6 +356,8 @@ def announce(audio_file_path, wait_for_audio=True, media_dir=None):
         audio_file_path: Path to the audio file to play
         media_dir: Directory to serve from HTTP server (default: ~/.local/share/openclaw/media/outbound)
         wait_for_audio: If True, calculate duration and wait. If False, just wait a fixed time.
+        title: Optional title to display on Sonos
+        artist: Optional artist to display on Sonos
     
     Returns:
         dict: Summary of what happened
@@ -367,7 +402,7 @@ def announce(audio_file_path, wait_for_audio=True, media_dir=None):
     audio_filename = os.path.basename(audio_file_path)
     audio_url = f"http://{HTTP_HOST}:{HTTP_PORT}/{audio_filename}"
     print(f"Playing: {audio_url}")
-    play_announcement(coordinators, audio_url)
+    play_announcement(coordinators, audio_url, title=title, artist=artist, media_dir=media_dir)
     
     # Wait for announcement
     print(f"Waiting {wait_time:.1f}s...")

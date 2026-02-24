@@ -37,6 +37,7 @@ def get_local_ip():
 # HTTP server config - auto-detect IP, allow env override
 HTTP_HOST = os.environ.get('SONOS_HTTP_HOST') or get_local_ip()
 HTTP_PORT = int(os.environ.get('SONOS_HTTP_PORT', 8888))
+PID_FILE = os.path.join(os.path.dirname(__file__), '.http_server.pid')
 
 
 def can_seek_uri(uri):
@@ -70,21 +71,60 @@ def start_http_server(media_dir=None):
     
     # Always kill any stale server first, then start fresh
     print("Stopping any existing HTTP server...")
-    if platform.system() == "Windows":
-        os.system(f'taskkill /f /t /im python.exe 2>nul')
-    else:
-        # Kill by port - more reliable on macOS
-        os.system(f"lsof -ti:{HTTP_PORT} | xargs kill -9 2>/dev/null")
-        os.system(f"pkill -9 -f 'python3 -m http.server {HTTP_PORT}' 2>/dev/null")
+    stop_http_server()
     time.sleep(1)
     
     print(f"Starting HTTP server from {media_dir}...")
     if platform.system() == "Windows":
-        os.system(f'start /b python -m http.server {HTTP_PORT}')
+        # Start server and save PID to file
+        os.system(f'start /b python -m http.server {HTTP_PORT} --directory "{media_dir}"')
+        # On Windows, we can't easily get the PID of start /b, so just track by port
+        # The stop_http_server will use port-based killing as fallback
     else:
-        # Use nohup to ensure it persists
+        # Use nohup to ensure it persists and save PID
         os.system(f'nohup python3 -m http.server {HTTP_PORT} --directory "{media_dir}" > /tmp/sonos_http.log 2>&1 &')
+        # Save PID for clean shutdown
+        time.sleep(1)
+        # Find the PID by port and save it
+        try:
+            pid = subprocess.check_output(f"lsof -ti:{HTTP_PORT}", shell=True).decode().strip()
+            with open(PID_FILE, 'w') as f:
+                f.write(pid)
+        except:
+            pass
     time.sleep(1)
+
+
+def stop_http_server():
+    """Stop the HTTP server gracefully using PID file, then fallback to port."""
+    # Try PID file first (cleanest)
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, 'r') as f:
+                pid = f.read().strip()
+            if pid:
+                os.kill(int(pid), 9)
+                print(f"Stopped HTTP server (PID {pid})")
+        except:
+            pass
+        try:
+            os.remove(PID_FILE)
+        except:
+            pass
+    
+    # Fallback: kill by port
+    if platform.system() == "Windows":
+        # Use netstat to find and kill the process on the port
+        try:
+            result = subprocess.run(
+                f'for /f "tokens=5" %a in (\'netstat -aon ^| findstr :{HTTP_PORT} ^| findstr LISTENING\') do taskkill /f /pid %a',
+                shell=True, capture_output=True, text=True
+            )
+        except:
+            pass
+    else:
+        os.system(f"lsof -ti:{HTTP_PORT} | xargs kill -9 2>/dev/null")
+        os.system(f"pkill -9 -f 'python3 -m http.server {HTTP_PORT}' 2>/dev/null")
 
 
 def is_external_input(uri):

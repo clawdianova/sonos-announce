@@ -1,5 +1,6 @@
 ---
 name: sonos-announce
+version: 1.0.2
 description: Play audio on Sonos with intelligent state restoration - pauses streaming, skips Line-In/TV/Bluetooth, resumes everything.
 metadata:
   {
